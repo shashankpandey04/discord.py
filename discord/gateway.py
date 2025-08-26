@@ -142,7 +142,7 @@ class KeepAliveHandler(threading.Thread):
         self.shard_id: Optional[int] = shard_id
         self.msg: str = 'Keeping shard ID %s websocket alive with sequence %s.'
         self.block_msg: str = 'Shard ID %s heartbeat blocked for more than %s seconds.'
-        self.behind_msg: str = 'Can\'t keep up, shard ID %s websocket is %.1fs behind.'
+        self.behind_msg: str = "Can't keep up, shard ID %s websocket is %.1fs behind."
         self._stop_ev: threading.Event = threading.Event()
         self._last_ack: float = time.perf_counter()
         self._last_send: float = time.perf_counter()
@@ -153,7 +153,7 @@ class KeepAliveHandler(threading.Thread):
     def run(self) -> None:
         while not self._stop_ev.wait(self.interval):
             if self._last_recv + self.heartbeat_timeout < time.perf_counter():
-                _log.warning("Shard ID %s has stopped responding to the gateway. Closing and restarting.", self.shard_id)
+                _log.warning('Shard ID %s has stopped responding to the gateway. Closing and restarting.', self.shard_id)
                 coro = self.ws.close(4000)
                 f = asyncio.run_coroutine_threadsafe(coro, loop=self.ws.loop)
 
@@ -161,9 +161,11 @@ class KeepAliveHandler(threading.Thread):
                     f.result()
                 except Exception:
                     _log.exception('An error occurred while stopping the gateway. Ignoring.')
+                except BaseException as exc:
+                    _log.debug('A BaseException was raised while stopping the gateway', exc_info=exc)
                 finally:
                     self.stop()
-                    return
+                return
 
             data = self.get_payload()
             _log.debug(self.msg, self.shard_id, data['d'])
@@ -213,6 +215,9 @@ class KeepAliveHandler(threading.Thread):
 
 
 class VoiceKeepAliveHandler(KeepAliveHandler):
+    if TYPE_CHECKING:
+        ws: DiscordVoiceWebSocket
+
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         name: str = kwargs.pop('name', f'voice-keep-alive-handler:{id(self):#x}')
         super().__init__(*args, name=name, **kwargs)
@@ -224,7 +229,10 @@ class VoiceKeepAliveHandler(KeepAliveHandler):
     def get_payload(self) -> Dict[str, Any]:
         return {
             'op': self.ws.HEARTBEAT,
-            'd': int(time.time() * 1000),
+            'd': {
+                't': int(time.time() * 1000),
+                'seq_ack': self.ws.seq_ack,
+            },
         }
 
     def ack(self) -> None:
@@ -831,6 +839,8 @@ class DiscordVoiceWebSocket:
         self._keep_alive: Optional[VoiceKeepAliveHandler] = None
         self._close_code: Optional[int] = None
         self.secret_key: Optional[List[int]] = None
+        # defaulting to -1
+        self.seq_ack: int = -1
         if hook:
             self._hook = hook  # type: ignore
 
@@ -851,6 +861,7 @@ class DiscordVoiceWebSocket:
                 'token': state.token,
                 'server_id': str(state.server_id),
                 'session_id': state.session_id,
+                'seq_ack': self.seq_ack,
             },
         }
         await self.send_as_json(payload)
@@ -875,14 +886,16 @@ class DiscordVoiceWebSocket:
         *,
         resume: bool = False,
         hook: Optional[Callable[..., Coroutine[Any, Any, Any]]] = None,
+        seq_ack: int = -1,
     ) -> Self:
         """Creates a voice websocket for the :class:`VoiceClient`."""
-        gateway = f'wss://{state.endpoint}/?v=4'
+        gateway = f'wss://{state.endpoint}/?v=8'
         client = state.voice_client
         http = client._state.http
         socket = await http.ws_connect(gateway, compress=15)
         ws = cls(socket, loop=client.loop, hook=hook)
         ws.gateway = gateway
+        ws.seq_ack = seq_ack
         ws._connection = state
         ws._max_heartbeat_timeout = 60.0
         ws.thread_id = threading.get_ident()
@@ -935,6 +948,7 @@ class DiscordVoiceWebSocket:
         _log.debug('Voice websocket frame received: %s', msg)
         op = msg['op']
         data = msg['d']  # According to Discord this key is always given
+        self.seq_ack = msg.get('seq', self.seq_ack)  # this key could not be given
 
         if op == self.READY:
             await self.initial_connection(data)
